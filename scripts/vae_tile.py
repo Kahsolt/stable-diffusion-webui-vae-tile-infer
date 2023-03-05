@@ -66,8 +66,8 @@ def get_var_mean(input, num_groups, eps=1e-6):
     b, c = input.size(0), input.size(1)
     channel_in_group = int(c/num_groups)
     input_reshaped = input.contiguous().view(1, int(b * num_groups), channel_in_group, *input.size()[2:])
-    var, mean = torch.var_mean(input_reshaped, dim=[0, 2, 3, 4], unbiased=False)
-    return var, mean
+    var, mean = torch.var_mean(input_reshaped.float(), dim=[0, 2, 3, 4], unbiased=False)
+    return var.to(input.dtype), mean.to(input.dtype)
 
 def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=1e-6):
     """
@@ -109,37 +109,42 @@ DEFAULT_DECODER_TILE_SIZE = get_default_decoder_tile_size()
 
 DEBUG_SHAPE = False
 
-
 # ↓↓↓ modified from 'ldm/modules/diffusionmodules/model.py' ↓↓↓
 
 def nonlinearity(x:Tensor) -> Tensor:
     return F.silu(x, inplace=True)
 
 def Resblock_forward(self:ResnetBlock, x:Tensor):   # yield-3
-    x = x.cpu()
-    
-    h = x.clone() ; yield self.norm1, h ; h = h.to(devices.device)
+    h = x.clone()
+    var, mean = get_var_mean(h, self.norm1.num_groups, self.norm1.eps)
+    h = h.cpu()
+    yield self.norm1, h, (var, mean)
+    h = h.to(devices.device)
     h = nonlinearity(h)
-    h = self.conv1(h)
+    h: Tensor = self.conv1(h)
 
-    h = h.cpu() ; yield self.norm2, h ; h = h.to(devices.device)
+    var, mean = get_var_mean(h, self.norm2.num_groups, self.norm2.eps)
+    h = h.cpu()
+    yield self.norm2, h, (var, mean)
+    h = h.to(devices.device)
     h = nonlinearity(h)
     #h = self.dropout(h)
     h = self.conv2(h)
 
     if self.in_channels != self.out_channels:
-        x = x.to(devices.device)
         if self.use_conv_shortcut:
             x = self.conv_shortcut(x)
         else:
             x = self.nin_shortcut(x)
-
-    yield x.to(devices.device) + h
+    yield x + h
 
 def AttnBlock_forward(self:AttnBlock, x:Tensor):    # yield-2
-    x = x.cpu()
+    h = x.clone()
+    var, mean = get_var_mean(h, self.norm.num_groups, self.norm.eps)
+    h = h.cpu()
+    yield self.norm, h, (var, mean)
+    h = h.to(devices.device)
 
-    h = x.clone() ; yield self.norm, h ; h = h.to(devices.device)
     q = self.q(h)
     k = self.k(h)
     v = self.v(h)
@@ -159,8 +164,8 @@ def AttnBlock_forward(self:AttnBlock, x:Tensor):    # yield-2
     h = torch.bmm(v, w)           # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
     h = h.reshape(B, C, H, W)
 
-    h = self.proj_out(h)
-    yield x.to(devices.device) + h
+    h: Tensor = self.proj_out(h)
+    yield x + h
 
 def Encoder_forward(self:Encoder, x:Tensor):        # yield-?
     # prenet
@@ -186,17 +191,20 @@ def Encoder_forward(self:Encoder, x:Tensor):        # yield-?
         if isinstance(item, Tensor): x = item
         else: yield item
     if DEBUG_SHAPE: print('block_1:', x.shape)
-    for item in AttnBlock_forward(self.mid.attn_1, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('attn_1:', x.shape)
+    #for item in AttnBlock_forward(self.mid.attn_1, x):
+    #    if isinstance(item, Tensor): x = item
+    #    else: yield item
+    #if DEBUG_SHAPE: print('attn_1:', x.shape)
     for item in Resblock_forward(self.mid.block_2, x):
         if isinstance(item, Tensor): x = item
         else: yield item
     if DEBUG_SHAPE: print('block_2:', x.shape)
 
     # end
-    x = x.cpu() ; yield self.norm_out, x ; x = x.to(devices.device)
+    var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
+    x = x.cpu()
+    yield self.norm_out, x, (var, mean)
+    x = x.to(devices.device)
     x = nonlinearity(x)
     x = self.conv_out(x)
     yield x.cpu()
@@ -211,10 +219,10 @@ def Decoder_forward(self:Decoder, x:Tensor):        # yield-?
         if isinstance(item, Tensor): x = item
         else: yield item
     if DEBUG_SHAPE: print('block_1:', x.shape)
-    for item in AttnBlock_forward(self.mid.attn_1, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('attn_1:', x.shape)
+    #for item in AttnBlock_forward(self.mid.attn_1, x):
+    #    if isinstance(item, Tensor): x = item
+    #    else: yield item
+    #if DEBUG_SHAPE: print('attn_1:', x.shape)
     for item in Resblock_forward(self.mid.block_2, x):
         if isinstance(item, Tensor): x = item
         else: yield item
@@ -238,7 +246,10 @@ def Decoder_forward(self:Decoder, x:Tensor):        # yield-?
     # end
     if self.give_pre_end: yield x.cpu()
 
-    x = x.cpu() ; yield self.norm_out, x ; x = x.to(devices.device)
+    var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
+    x = x.cpu()
+    yield self.norm_out, x, (var, mean)
+    x = x.to(devices.device)
     x = nonlinearity(x)
     x = self.conv_out(x)
     if DEBUG_SHAPE: print(f'conv_out:', x.shape)
@@ -258,7 +269,7 @@ def perfcount(fn):
         gc.collect()
 
         ret = fn(*args, **kwargs)
-        
+
         devices.torch_gc()
         gc.collect()
         if torch.cuda.is_available():
@@ -272,12 +283,13 @@ def perfcount(fn):
     return wrapper
 
 @perfcount
+@torch.inference_mode()
 def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_size:int):
     B, C, H, W = z.shape
     is_decoder = isinstance(self, Decoder)
     scaler = opt_f if is_decoder else 1/opt_f
     ch = 3 if is_decoder else 8
-    steps = 31 if is_decoder else 23
+    steps = 30 if is_decoder else 22
 
     if 'estimate max tensor shape':
         if is_decoder:
@@ -328,6 +340,8 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
     else:
         result = z[:, :ch, :H//opt_f, :W//opt_f]
 
+    del z
+
     interrupted = False
     pbar = tqdm(total=steps, desc=f'VAE tile {"decoding" if is_decoder else "encoding"}')
     while True:
@@ -336,52 +350,37 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
 
         try:
             outputs = [ next(worker) for worker in workers ]
-            ret_types = { type(o) for o in outputs }
+            if not 'check outputs type consistency':
+                ret_type = type(outputs[0])
+            else:
+                ret_types = { type(o) for o in outputs }
+                assert len(ret_types) == 1
+                ret_type = ret_types.pop()
         except StopIteration:
             print_exc()
             raise ValueError('Error: workers stopped early !!')
 
-        if   ret_types == { tuple }:    # GroupNorm sync barrier
-            gns = { gn for gn, _ in outputs }
-            if len(gns) > 1:
-                print(f'group_norms: {gns}')
-                raise ValueError('Error: workers progressing states not synchronized !!')
+        if ret_type == tuple:      # GroupNorm sync barrier
+            if not 'check gn object identity':
+                gn: GroupNorm = outputs[0][0]
+            else:
+                gns = { gn for gn, _, _ in outputs }
+                if len(gns) > 1:
+                    print(f'group_norms: {gns}')
+                    raise ValueError('Error: workers progressing states not synchronized !!')
+                gn: GroupNorm = list(gns)[0]
 
-            gn: GroupNorm = list(gns)[0]
-            num_groups = gn.num_groups
-            weight     = gn.weight                      # 'cuda'
-            bias       = gn.bias
-            eps        = gn.eps
-            del gns
+            if DEBUG_SHAPE: print('tile.shape:', outputs[0][1].shape)
 
-            tiles = [ tile for _, tile in outputs ]     # 'cpu'
-            if DEBUG_SHAPE: print('tile.shape:', tiles[0].shape)
-
-            dtype = None
-            var_list, mean_list = [], []
-            for tile in tiles:
+            var  = torch.stack([var  for _, _, (var, _)  in outputs], dim=-1).mean(dim=-1)     # [NG=32], float32
+            mean = torch.stack([mean for _, _, (_, mean) in outputs], dim=-1).mean(dim=-1)
+            for _, tile, _ in outputs:
                 if state.interrupted: interrupted = True ; break
 
-                dtype = tile.dtype
-                var, mean = get_var_mean(tile.float().to(devices.device), num_groups, eps)
-                var_list.append(var)
-                mean_list.append(mean)
-            var  = torch.stack(var_list,  dim=0).mean(dim=0).to(devices.device)     # [NG=32], float32
-            mean = torch.stack(mean_list, dim=0).mean(dim=0).to(devices.device)
-            del var_list, mean_list
+                tile_n = custom_group_norm(tile.to(devices.device), gn.num_groups, mean, var, gn.weight, gn.bias, gn.eps)
+                tile.data = tile_n.to(tile.dtype).cpu()
 
-            for tile in tiles:
-                if state.interrupted: interrupted = True ; break
-
-                tile_n = custom_group_norm(tile.float().to(devices.device), num_groups, mean, var, weight, bias, eps)
-                tile_n = tile_n.to(dtype).cpu()
-                tile.data = tile_n
-            del tiles
-
-            devices.torch_gc()
-            gc.collect()
-
-        elif ret_types == { Tensor }:   # final Tensor splits
+        elif ret_type == Tensor:   # final Tensor splits
             if DEBUG_SHAPE: print('output.shape:', outputs[0].shape)    # 'cpu'
             assert len(bbox_outputs) == len(outputs), 'n_tiles != n_bbox_outputs'
 
@@ -396,15 +395,13 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
                 (Hs, He), (Ws, We) = bbox
                 result[:, :, Hs:He, Ws:We] += crop_pad(outputs[i], int(pad_size * scaler))
                 count [:, :, Hs:He, Ws:We] += 1
-            del outputs
 
             count = count.clamp_(min=1)
             result /= count
             break       # we're done!
 
         else:
-            print(f'ret_types: {ret_types}')
-            raise ValueError('Error: workers progressing states not synchronized !!')
+            raise ValueError(f'Error: unkown ret_type: {ret_type} !!')
 
     # Done!
     pbar.close()
