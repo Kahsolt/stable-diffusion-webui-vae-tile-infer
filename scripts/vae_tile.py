@@ -16,14 +16,19 @@ import modules.devices as devices
 from modules.scripts import Script, AlwaysVisible
 from modules.shared import state
 from modules.processing import opt_f
+from modules.ui import gr_show
 
-from typing import Union
+from typing import Tuple, List, Union, Generator
 from torch import Tensor
 from torch.nn import GroupNorm
 from modules.processing import StableDiffusionProcessing
 from ldm.models.autoencoder import AutoencoderKL
 from ldm.modules.diffusionmodules.model import Encoder, Decoder, ResnetBlock, AttnBlock
 
+Net = Union[Encoder, Decoder]
+Tile = Var = Mean = Tensor
+TaskRet = Union[Tuple[GroupNorm, Tile, Tuple[Var, Mean]], Tile]
+TaskGen = Generator[TaskRet, None, None]
 
 # ↓↓↓ copied from https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111 ↓↓↓
 
@@ -100,35 +105,84 @@ def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=
 # ↑↑↑ copied from https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111 ↑↑↑
 
 
-DEFAULT_OPEN = False
-DEFAULT_ENABLED = True
-DEFAULT_ENCODER_PAD_SIZE = 16
-DEFAULT_DECODER_PAD_SIZE = 2
-DEFAULT_ENCODER_TILE_SIZE = get_default_encoder_tile_size()
-DEFAULT_DECODER_TILE_SIZE = get_default_decoder_tile_size()
+if 'global const':
+    DEFAULT_OPEN = False
+    DEFAULT_ENABLED = True
+    DEFAULT_ENCODER_PAD_SIZE = 16
+    DEFAULT_DECODER_PAD_SIZE = 2
+    DEFAULT_ENCODER_TILE_SIZE = get_default_encoder_tile_size()
+    DEFAULT_DECODER_TILE_SIZE = get_default_decoder_tile_size()
+    DEFAULT_AUTO_SHRINK = True
+    DEFAULT_SKIP_INFER = False
 
-DEBUG_SHAPE = False
+    DEBUG_SHAPE = False
+
+if 'global var':
+    sync_gn: bool = True
+    auto_shrink: bool = None
+    skip_infer = {
+        Encoder: {
+            'down0.block0': False,
+            'down0.block1': False,
+            'down1.block0': False,
+            'down1.block1': False,
+            'down2.block0': False,
+            'down2.block1': False,
+            'down3.block0': False,
+            'down3.block1': False,
+            'mid.block_1': False,
+            'mid.attn_1':  False,
+            'mid.block_2': False,
+        },
+        Decoder: {
+            'mid.block_1': False,
+            'mid.attn_1':  False,
+            'mid.block_2': False,
+            'up3.block0': False,
+            'up3.block1': False,
+            'up3.block2': False,
+            'up2.block0': False,
+            'up2.block1': False,
+            'up2.block2': False,
+            'up1.block0': False,
+            'up1.block1': False,
+            'up1.block2': False,
+            'up0.block0': False,
+            'up0.block1': False,
+            'up0.block2': False,
+        }
+    }
+
 
 # ↓↓↓ modified from 'ldm/modules/diffusionmodules/model.py' ↓↓↓
 
 def nonlinearity(x:Tensor) -> Tensor:
     return F.silu(x, inplace=True)
 
-def Resblock_forward(self:ResnetBlock, x:Tensor):   # yield-3
-    h = x.clone()
-    var, mean = get_var_mean(h, self.norm1.num_groups, self.norm1.eps)
-    h = h.cpu()
-    yield self.norm1, h, (var, mean)
-    h = h.to(devices.device)
+def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
+    h = x
+
+    if sync_gn:
+        var, mean = get_var_mean(h, self.norm1.num_groups, self.norm1.eps)
+        h = h.cpu()
+        yield self.norm1, h, (var, mean)
+        h = h.to(devices.device)
+    else:
+        h = self.norm1(h)
+
     h = nonlinearity(h)
     h: Tensor = self.conv1(h)
 
-    var, mean = get_var_mean(h, self.norm2.num_groups, self.norm2.eps)
-    h = h.cpu()
-    yield self.norm2, h, (var, mean)
-    h = h.to(devices.device)
+    if sync_gn:
+        var, mean = get_var_mean(h, self.norm2.num_groups, self.norm2.eps)
+        h = h.cpu()
+        yield self.norm2, h, (var, mean)
+        h = h.to(devices.device)
+    else:
+        h = self.norm2(h)
+
     h = nonlinearity(h)
-    #h = self.dropout(h)
+    h = self.dropout(h)
     h = self.conv2(h)
 
     if self.in_channels != self.out_channels:
@@ -138,12 +192,16 @@ def Resblock_forward(self:ResnetBlock, x:Tensor):   # yield-3
             x = self.nin_shortcut(x)
     yield x + h
 
-def AttnBlock_forward(self:AttnBlock, x:Tensor):    # yield-2
-    h = x.clone()
-    var, mean = get_var_mean(h, self.norm.num_groups, self.norm.eps)
-    h = h.cpu()
-    yield self.norm, h, (var, mean)
-    h = h.to(devices.device)
+def AttnBlock_forward(self:AttnBlock, x:Tensor) -> TaskGen:
+    h = x
+
+    if sync_gn:
+        var, mean = get_var_mean(h, self.norm.num_groups, self.norm.eps)
+        h = h.cpu()
+        yield self.norm, h, (var, mean)
+        h = h.to(devices.device)
+    else:
+        h = self.norm(h)
 
     q = self.q(h)
     k = self.k(h)
@@ -167,78 +225,88 @@ def AttnBlock_forward(self:AttnBlock, x:Tensor):    # yield-2
     h: Tensor = self.proj_out(h)
     yield x + h
 
-def Encoder_forward(self:Encoder, x:Tensor):        # yield-?
+def Encoder_forward(self:Encoder, x:Tensor) -> TaskGen:
     # prenet
     x = self.conv_in(x)
     if DEBUG_SHAPE: print('conv_in:', x.shape)
 
+    skip_enc = skip_infer[Encoder]
+
     # downsampling
     for i_level in range(self.num_resolutions):
         for i_block in range(self.num_res_blocks):
-            for item in Resblock_forward(self.down[i_level].block[i_block], x):
-                if isinstance(item, Tensor): x = item
-                else: yield item
-            if DEBUG_SHAPE: print(f'down[{i_level}].block[{i_block}]:', x.shape)
-            if len(self.down[i_level].attn) > 0:      # assert empty
-                for item in AttnBlock_forward(self.down[i_level].attn[i_block], x):
+            if not skip_enc[f'down{i_level}.block{i_block}']:
+                for item in Resblock_forward(self.down[i_level].block[i_block], x):
                     if isinstance(item, Tensor): x = item
                     else: yield item
+                if DEBUG_SHAPE: print(f'down[{i_level}].block[{i_block}]:', x.shape)
+            assert not len(self.down[i_level].attn)
         if i_level != self.num_resolutions-1:
             x = self.down[i_level].downsample(x)
 
     # middle
-    for item in Resblock_forward(self.mid.block_1, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('block_1:', x.shape)
-    #for item in AttnBlock_forward(self.mid.attn_1, x):
-    #    if isinstance(item, Tensor): x = item
-    #    else: yield item
-    #if DEBUG_SHAPE: print('attn_1:', x.shape)
-    for item in Resblock_forward(self.mid.block_2, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('block_2:', x.shape)
+    if not skip_enc['mid.block_1']:
+        for item in Resblock_forward(self.mid.block_1, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('block_1:', x.shape)
+    if not skip_enc['mid.attn_1']:
+        for item in AttnBlock_forward(self.mid.attn_1, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('attn_1:', x.shape)
+    if not skip_enc['mid.block_2']:
+        for item in Resblock_forward(self.mid.block_2, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('block_2:', x.shape)
 
     # end
-    var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
-    x = x.cpu()
-    yield self.norm_out, x, (var, mean)
-    x = x.to(devices.device)
+    if sync_gn:
+        var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
+        x = x.cpu()
+        yield self.norm_out, x, (var, mean)
+        x = x.to(devices.device)
+    else:
+        x = self.norm_out(x)
+
     x = nonlinearity(x)
     x = self.conv_out(x)
     yield x.cpu()
 
-def Decoder_forward(self:Decoder, x:Tensor):        # yield-?
+def Decoder_forward(self:Decoder, x:Tensor) -> TaskGen:
     # prenet
     x = self.conv_in(x)     # [B, C=4, H, W] => [B, C=512, H, W]
     if DEBUG_SHAPE: print('conv_in:', x.shape)
 
+    skip_dec = skip_infer[Decoder]
+
     # middle
-    for item in Resblock_forward(self.mid.block_1, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('block_1:', x.shape)
-    #for item in AttnBlock_forward(self.mid.attn_1, x):
-    #    if isinstance(item, Tensor): x = item
-    #    else: yield item
-    #if DEBUG_SHAPE: print('attn_1:', x.shape)
-    for item in Resblock_forward(self.mid.block_2, x):
-        if isinstance(item, Tensor): x = item
-        else: yield item
-    if DEBUG_SHAPE: print('block_2:', x.shape)
+    if not skip_dec['mid.block_1']:
+        for item in Resblock_forward(self.mid.block_1, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('block_1:', x.shape)
+    if not skip_dec['mid.attn_1']:
+        for item in AttnBlock_forward(self.mid.attn_1, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('attn_1:', x.shape)
+    if not skip_dec['mid.block_2']:
+        for item in Resblock_forward(self.mid.block_2, x):
+            if isinstance(item, Tensor): x = item
+            else: yield item
+        if DEBUG_SHAPE: print('block_2:', x.shape)
 
     # upsampling
     for i_level in reversed(range(self.num_resolutions)):
         for i_block in range(self.num_res_blocks+1):
-            for item in Resblock_forward(self.up[i_level].block[i_block], x):
-                if isinstance(item, Tensor): x = item
-                else: yield item
-            if DEBUG_SHAPE: print(f'up[{i_level}].block[{i_block}]:', x.shape)
-            if len(self.up[i_level].attn) > 0:      # assert empty
-                for item in AttnBlock_forward(self.up[i_level].attn[i_block], x):
+            if not skip_dec[f'up{i_level}.block{i_block}']:
+                for item in Resblock_forward(self.up[i_level].block[i_block], x):
                     if isinstance(item, Tensor): x = item
                     else: yield item
+                if DEBUG_SHAPE: print(f'up[{i_level}].block[{i_block}]:', x.shape)
+            assert not len(self.up[i_level].attn)
         if i_level != 0:
             x = self.up[i_level].upsample(x)
             if DEBUG_SHAPE: print(f'up[{i_level}].upsample:', x.shape)
@@ -246,10 +314,14 @@ def Decoder_forward(self:Decoder, x:Tensor):        # yield-?
     # end
     if self.give_pre_end: yield x.cpu()
 
-    var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
-    x = x.cpu()
-    yield self.norm_out, x, (var, mean)
-    x = x.to(devices.device)
+    if sync_gn:
+        var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
+        x = x.cpu()
+        yield self.norm_out, x, (var, mean)
+        x = x.to(devices.device)
+    else:
+        x = self.norm_out(x)
+
     x = nonlinearity(x)
     x = self.conv_out(x)
     if DEBUG_SHAPE: print(f'conv_out:', x.shape)
@@ -284,12 +356,32 @@ def perfcount(fn):
 
 @perfcount
 @torch.inference_mode()
-def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_size:int):
+def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
+    global sync_gn, auto_shrink, skip_infer
+
     B, C, H, W = z.shape
     is_decoder = isinstance(self, Decoder)
     scaler = opt_f if is_decoder else 1/opt_f
     ch = 3 if is_decoder else 8
-    steps = 30 if is_decoder else 22
+    steps = 31 if is_decoder else 23
+
+    if auto_shrink:
+        def auto_tile_size(low:int, high:int) -> int:
+            ''' VRAM saving when close to low, GPU warp friendy when close to high '''
+            align_size = 64 if is_decoder else 512
+            while low < high:
+                r = low % align_size
+                if low + r > high:
+                    align_size //= 2
+                else:
+                    return low + r
+            return high
+
+        n_tiles_H = math.ceil(H / tile_size)
+        n_tiles_W = math.ceil(W / tile_size)
+        ts_low  = math.ceil(max(H / n_tiles_H, W / n_tiles_W))
+        ts_high = math.ceil(max(H / (n_tiles_H - 0.15), W / (n_tiles_W - 0.15)))    # assure last tile fill 72.25%
+        tile_size = auto_tile_size(ts_low, ts_high)
 
     if 'estimate max tensor shape':
         if is_decoder:
@@ -301,9 +393,19 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
 
     n_tiles_H = math.ceil(H / tile_size)
     n_tiles_W = math.ceil(W / tile_size)
+    n_tiles = n_tiles_H * n_tiles_W
+    sync_gn = n_tiles > 1
+    fill_ratio = H * W / (n_tiles * tile_size**2)
     print(f'>> input_size: {z.shape}')
     print(f'>> tile_size: {tile_size}')
-    print(f'>> split to {n_tiles_H}x{n_tiles_W} = {n_tiles_H*n_tiles_W} tiles')
+    print(f'>> split to {n_tiles_H}x{n_tiles_W} = {n_tiles} tiles (corner crop ratio: {1 - fill_ratio:.3%})')
+
+    if not sync_gn:
+        steps = 1
+    for block, skip in skip_infer[type(self)].items():
+        if not skip: continue
+        if   'attn'  in block: steps -= 1
+        elif 'block' in block: steps -= 2
 
     if pad_size != 0: z = F.pad(z, (pad_size, pad_size, pad_size, pad_size), mode='reflect')     # [B, C, H+2*pad, W+2*pad]
 
@@ -329,7 +431,7 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
         print('bbox_outputs:')
         print(bbox_outputs)
 
-    workers = []
+    workers: List[TaskGen] = []
     for bbox in bbox_inputs:
         (Hs, He), (Ws, We) = bbox
         tile = z[:, :, Hs:He, Ws:We]
@@ -370,18 +472,25 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
                     raise ValueError('Error: workers progressing states not synchronized !!')
                 gn: GroupNorm = list(gns)[0]
 
-            if DEBUG_SHAPE: print('tile.shape:', outputs[0][1].shape)
+            if DEBUG_SHAPE:
+                print('n_tiles:', len(outputs))
+                print('tile.shape:', outputs[0][1].shape)
+                print('tile.dtype:', outputs[0][1].dtype)   # 'cpu'
 
             var  = torch.stack([var  for _, _, (var, _)  in outputs], dim=-1).mean(dim=-1)     # [NG=32], float32
             mean = torch.stack([mean for _, _, (_, mean) in outputs], dim=-1).mean(dim=-1)
             for _, tile, _ in outputs:
                 if state.interrupted: interrupted = True ; break
 
+                #tile_n = gn(tile.to(devices.device))
                 tile_n = custom_group_norm(tile.to(devices.device), gn.num_groups, mean, var, gn.weight, gn.bias, gn.eps)
                 tile.data = tile_n.to(tile.dtype).cpu()
 
         elif ret_type == Tensor:   # final Tensor splits
-            if DEBUG_SHAPE: print('output.shape:', outputs[0].shape)    # 'cpu'
+            if DEBUG_SHAPE:
+              print('n_outputs:', len(outputs))
+              print('output.shape:', outputs[0].shape)
+              print('output.dtype:', outputs[0].dtype)      # 'cpu'
             assert len(bbox_outputs) == len(outputs), 'n_tiles != n_bbox_outputs'
 
             result = torch.zeros([B, ch, int(H*scaler), int(W*scaler)], dtype=outputs[0].dtype)
@@ -410,11 +519,6 @@ def VAE_forward_tile(self:Union[Encoder, Decoder], z:Tensor, tile_size:int, pad_
 
     return result
 
-def VAE_hijack(self:Union[Encoder, Decoder], x:Tensor, tile_size:int, pad_size:int):
-    B, C, H, W = x.shape
-    if max(H, W) <= tile_size: return self.original_forward(x)
-    else: return VAE_forward_tile(self, x, tile_size, pad_size)
-
 
 class Script(Script):
 
@@ -441,9 +545,110 @@ class Script(Script):
             reset.click(fn=lambda: [DEFAULT_ENCODER_TILE_SIZE, DEFAULT_ENCODER_PAD_SIZE, DEFAULT_DECODER_TILE_SIZE, DEFAULT_DECODER_PAD_SIZE], 
                         outputs=[encoder_tile_size, encoder_pad_size, decoder_tile_size, decoder_pad_size])
 
-        return [ enabled, encoder_tile_size, encoder_pad_size, decoder_tile_size, decoder_pad_size ]
+            with gr.Row():
+                ext_auto_shrink = gr.Checkbox(label='Auto adjust real tile size', value=lambda: DEFAULT_AUTO_SHRINK)
+                ext_skip_infer  = gr.Checkbox(label='Skip infer (experimental)',  value=lambda: DEFAULT_SKIP_INFER)
 
-    def process(self, p:StableDiffusionProcessing, enabled:bool, encoder_tile_size:int, encoder_pad_size:int, decoder_tile_size:int, decoder_pad_size:int):
+            with gr.Group(visible=DEFAULT_SKIP_INFER) as tab_skip_infer:
+                with gr.Accordion(label='Skip encoder blocks'):
+                    with gr.Row(variant='compact'):
+                        skip_enc_down0_block0 = gr.Checkbox(label='down0.block0')
+                        skip_enc_down0_block1 = gr.Checkbox(label='down0.block1')
+                        skip_enc_down1_block0 = gr.Checkbox(label='down1.block0')
+                        skip_enc_down1_block1 = gr.Checkbox(label='down1.block1')
+                    with gr.Row(variant='compact'):
+                        skip_enc_down2_block0 = gr.Checkbox(label='down2.block0')
+                        skip_enc_down2_block1 = gr.Checkbox(label='down2.block1')
+                        skip_enc_down3_block0 = gr.Checkbox(label='down3.block0')
+                        skip_enc_down3_block1 = gr.Checkbox(label='down3.block1')
+                    with gr.Row(variant='compact'): 
+                        skip_enc_mid_block_1  = gr.Checkbox(label='mid.block_1')
+                        skip_enc_mid_attn_1   = gr.Checkbox(label='mid.attn_1')
+                        skip_enc_mid_block_2  = gr.Checkbox(label='mid.block_2')
+
+                with gr.Accordion(label='Skip decoder blocks'):
+                    with gr.Row(variant='compact'):
+                        skip_dec_mid_block_1 = gr.Checkbox(label='mid.block_1')
+                        skip_dec_mid_attn_1  = gr.Checkbox(label='mid.attn_1')
+                        skip_dec_mid_block_2 = gr.Checkbox(label='mid.block_2')
+                    with gr.Row(variant='compact'):
+                        skip_dec_up3_block0  = gr.Checkbox(label='up3.block0')
+                        skip_dec_up3_block1  = gr.Checkbox(label='up3.block1')
+                        skip_dec_up3_block2  = gr.Checkbox(label='up3.block2')
+                    with gr.Row(variant='compact'):
+                        skip_dec_up2_block0  = gr.Checkbox(label='up2.block0')
+                        skip_dec_up2_block1  = gr.Checkbox(label='up2.block1')
+                        skip_dec_up2_block2  = gr.Checkbox(label='up2.block2')
+                    with gr.Row(variant='compact'):
+                        skip_dec_up1_block1  = gr.Checkbox(label='up1.block1')
+                        skip_dec_up1_block2  = gr.Checkbox(label='up1.block2')
+                        skip_dec_up0_block1  = gr.Checkbox(label='up0.block1')
+                        skip_dec_up0_block2  = gr.Checkbox(label='up0.block2')
+
+            ext_skip_infer.change(fn=lambda x: gr_show(x), inputs=ext_skip_infer, outputs=tab_skip_infer, show_progress=False)
+
+        return [
+            enabled, 
+            encoder_tile_size, encoder_pad_size, 
+            decoder_tile_size, decoder_pad_size,
+            ext_auto_shrink, ext_skip_infer,
+            skip_enc_down0_block0,
+            skip_enc_down0_block1,
+            skip_enc_down1_block0,
+            skip_enc_down1_block1,
+            skip_enc_down2_block0,
+            skip_enc_down2_block1,
+            skip_enc_down3_block0,
+            skip_enc_down3_block1,
+            skip_enc_mid_block_1,
+            skip_enc_mid_attn_1,
+            skip_enc_mid_block_2,
+            skip_dec_mid_block_1,
+            skip_dec_mid_attn_1,
+            skip_dec_mid_block_2,
+            skip_dec_up3_block0,
+            skip_dec_up3_block1,
+            skip_dec_up3_block2,
+            skip_dec_up2_block0,
+            skip_dec_up2_block1,
+            skip_dec_up2_block2,
+            skip_dec_up1_block1,
+            skip_dec_up1_block2,
+            skip_dec_up0_block1,
+            skip_dec_up0_block2,
+        ]
+
+    def process(self, p:StableDiffusionProcessing, 
+            enabled:bool, 
+            encoder_tile_size:int, encoder_pad_size:int, 
+            decoder_tile_size:int, decoder_pad_size:int,
+            ext_auto_shrink:bool, ext_skip_infer:bool,
+            skip_enc_down0_block0:bool,
+            skip_enc_down0_block1:bool,
+            skip_enc_down1_block0:bool,
+            skip_enc_down1_block1:bool,
+            skip_enc_down2_block0:bool,
+            skip_enc_down2_block1:bool,
+            skip_enc_down3_block0:bool,
+            skip_enc_down3_block1:bool,
+            skip_enc_mid_block_1:bool,
+            skip_enc_mid_attn_1:bool,
+            skip_enc_mid_block_2:bool,
+            skip_dec_mid_block_1:bool,
+            skip_dec_mid_attn_1:bool,
+            skip_dec_mid_block_2:bool,
+            skip_dec_up3_block0:bool,
+            skip_dec_up3_block1:bool,
+            skip_dec_up3_block2:bool,
+            skip_dec_up2_block0:bool,
+            skip_dec_up2_block1:bool,
+            skip_dec_up2_block2:bool,
+            skip_dec_up1_block1:bool,
+            skip_dec_up1_block2:bool,
+            skip_dec_up0_block1:bool,
+            skip_dec_up0_block2:bool,
+        ):
+
         vae: AutoencoderKL = p.sd_model.first_stage_model
         if vae.device == torch.device('cpu'): return
         
@@ -454,10 +659,51 @@ class Script(Script):
         if not hasattr(encoder, 'original_forward'): encoder.original_forward = encoder.forward
         if not hasattr(decoder, 'original_forward'): decoder.original_forward = decoder.forward
 
-        # apply or undo hijack
+        # undo hijack
         if not enabled:
             encoder.forward = encoder.original_forward
             decoder.forward = decoder.original_forward
+            return
+
+        global auto_shrink, skip_infer
+
+        # store setting to globals
+        auto_shrink = ext_auto_shrink
+        if ext_skip_infer:
+            skip_infer[Encoder].update({
+                'down0.block0': skip_enc_down0_block0,
+                'down0.block1': skip_enc_down0_block1,
+                'down1.block0': skip_enc_down1_block0,
+                'down1.block1': skip_enc_down1_block1,
+                'down2.block0': skip_enc_down2_block0,
+                'down2.block1': skip_enc_down2_block1,
+                'down3.block0': skip_enc_down3_block0,
+                'down3.block1': skip_enc_down3_block1,
+                'mid.block_1':  skip_enc_mid_block_1,
+                'mid.attn_1':   skip_enc_mid_attn_1,
+                'mid.block_2':  skip_enc_mid_block_2,
+            })
+            skip_infer[Decoder].update({
+                'mid.block_1': skip_dec_mid_block_1,
+                'mid.attn_1':  skip_dec_mid_attn_1,
+                'mid.block_2': skip_dec_mid_block_2,
+                'up3.block0':  skip_dec_up3_block0,
+                'up3.block1':  skip_dec_up3_block1,
+                'up3.block2':  skip_dec_up3_block2,
+                'up2.block0':  skip_dec_up2_block0,
+                'up2.block1':  skip_dec_up2_block1,
+                'up2.block2':  skip_dec_up2_block2,
+                'up1.block1':  skip_dec_up1_block1,
+                'up1.block2':  skip_dec_up1_block2,
+                'up0.block1':  skip_dec_up0_block1,
+                'up0.block2':  skip_dec_up0_block2,
+            })
         else:
-            encoder.forward = lambda x: VAE_hijack(encoder, x, encoder_tile_size, encoder_pad_size)
-            decoder.forward = lambda x: VAE_hijack(decoder, x, decoder_tile_size, decoder_pad_size)
+            for net in [Encoder, Decoder]:
+                plan = skip_infer[net]
+                for block in plan.keys():
+                    plan[block] = False
+
+        # apply hijack
+        encoder.forward = lambda x: VAE_forward_tile(encoder, x, encoder_tile_size, encoder_pad_size)
+        decoder.forward = lambda x: VAE_forward_tile(decoder, x, decoder_tile_size, decoder_pad_size)
