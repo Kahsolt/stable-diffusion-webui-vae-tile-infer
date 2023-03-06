@@ -4,6 +4,7 @@
 
 import math
 from time import time
+from collections import defaultdict
 from traceback import print_exc
 import gc
 
@@ -71,8 +72,8 @@ def get_var_mean(input, num_groups, eps=1e-6):
     b, c = input.size(0), input.size(1)
     channel_in_group = int(c/num_groups)
     input_reshaped = input.contiguous().view(1, int(b * num_groups), channel_in_group, *input.size()[2:])
-    var, mean = torch.var_mean(input_reshaped.float(), dim=[0, 2, 3, 4], unbiased=False)
-    return var.to(input.dtype), mean.to(input.dtype)
+    var, mean = torch.var_mean(input_reshaped, dim=[0, 2, 3, 4], unbiased=False)
+    return var, mean
 
 def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=1e-6):
     """
@@ -112,15 +113,25 @@ if 'global const':
     DEFAULT_DECODER_PAD_SIZE = 2
     DEFAULT_ENCODER_TILE_SIZE = get_default_encoder_tile_size()
     DEFAULT_DECODER_TILE_SIZE = get_default_decoder_tile_size()
+    
     DEFAULT_AUTO_SHRINK = True
+    DEFAULT_ZIGZAG_PROCESS = True
+    DEFAULT_FORCE_UNSYNC = False
     DEFAULT_SKIP_INFER = False
 
     DEBUG_SHAPE = False
+    DEBUG_STAGE = False
 
 if 'global var':
-    sync_gn: bool = True
-    auto_shrink: bool = None
-    skip_infer = {
+    auto_shrink:    bool = None
+    zigzag_process: bool = None
+    force_unsync:   bool = None
+    skip_infer:     bool = None
+
+    zigzag_dir:     bool = True     # False: ->, True: <-
+    zigzag_to_cpu:  bool = True     # to 'cpu'
+    sync_gn:        bool = False
+    skip_infer_plan = {
         Encoder: {
             'down0.block0': False,
             'down0.block1': False,
@@ -160,11 +171,14 @@ def nonlinearity(x:Tensor) -> Tensor:
     return F.silu(x, inplace=True)
 
 def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
-    h = x
+    if zigzag_process and not zigzag_to_cpu:
+        h = x.clone()
+    else:
+        h = x
 
     if sync_gn:
         var, mean = get_var_mean(h, self.norm1.num_groups, self.norm1.eps)
-        h = h.cpu()
+        if zigzag_to_cpu: h = h.cpu()
         yield self.norm1, h, (var, mean)
         h = h.to(devices.device)
     else:
@@ -175,14 +189,14 @@ def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
 
     if sync_gn:
         var, mean = get_var_mean(h, self.norm2.num_groups, self.norm2.eps)
-        h = h.cpu()
+        if zigzag_to_cpu: h = h.cpu()
         yield self.norm2, h, (var, mean)
         h = h.to(devices.device)
     else:
         h = self.norm2(h)
 
     h = nonlinearity(h)
-    h = self.dropout(h)
+    #h = self.dropout(h)
     h = self.conv2(h)
 
     if self.in_channels != self.out_channels:
@@ -193,11 +207,14 @@ def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
     yield x + h
 
 def AttnBlock_forward(self:AttnBlock, x:Tensor) -> TaskGen:
-    h = x
+    if zigzag_process and not zigzag_to_cpu:
+        h = x.clone()
+    else:
+        h = x
 
     if sync_gn:
         var, mean = get_var_mean(h, self.norm.num_groups, self.norm.eps)
-        h = h.cpu()
+        if zigzag_to_cpu: h = h.cpu()
         yield self.norm, h, (var, mean)
         h = h.to(devices.device)
     else:
@@ -230,7 +247,7 @@ def Encoder_forward(self:Encoder, x:Tensor) -> TaskGen:
     x = self.conv_in(x)
     if DEBUG_SHAPE: print('conv_in:', x.shape)
 
-    skip_enc = skip_infer[Encoder]
+    skip_enc = skip_infer_plan[Encoder] if skip_infer else defaultdict(lambda: False)
 
     # downsampling
     for i_level in range(self.num_resolutions):
@@ -264,7 +281,7 @@ def Encoder_forward(self:Encoder, x:Tensor) -> TaskGen:
     # end
     if sync_gn:
         var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
-        x = x.cpu()
+        if zigzag_to_cpu: x = x.cpu()
         yield self.norm_out, x, (var, mean)
         x = x.to(devices.device)
     else:
@@ -279,7 +296,7 @@ def Decoder_forward(self:Decoder, x:Tensor) -> TaskGen:
     x = self.conv_in(x)     # [B, C=4, H, W] => [B, C=512, H, W]
     if DEBUG_SHAPE: print('conv_in:', x.shape)
 
-    skip_dec = skip_infer[Decoder]
+    skip_dec = skip_infer_plan[Decoder] if skip_infer else defaultdict(lambda: False)
 
     # middle
     if not skip_dec['mid.block_1']:
@@ -316,7 +333,7 @@ def Decoder_forward(self:Decoder, x:Tensor) -> TaskGen:
 
     if sync_gn:
         var, mean = get_var_mean(x, self.norm_out.num_groups, self.norm_out.eps)
-        x = x.cpu()
+        if zigzag_to_cpu: x = x.cpu()
         yield self.norm_out, x, (var, mean)
         x = x.to(devices.device)
     else:
@@ -339,31 +356,35 @@ def perfcount(fn):
             torch.cuda.reset_peak_memory_stats(devices.device)
         devices.torch_gc()
         gc.collect()
-
-        ret = fn(*args, **kwargs)
-
-        devices.torch_gc()
-        gc.collect()
-        if torch.cuda.is_available():
-            vram = torch.cuda.max_memory_allocated(devices.device) / 2**20
-            torch.cuda.reset_peak_memory_stats(devices.device)
-            print(f'Done in {time() - ts:.3f}s, max VRAM alloc {vram:.3f} MB')
-        else:
-            print(f'Done in {time() - ts:.3f}s')
-
-        return ret
+        
+        try:
+            return fn(*args, **kwargs)
+        except:
+            raise
+        finally:
+            devices.torch_gc()
+            gc.collect()
+            if torch.cuda.is_available():
+                vram = torch.cuda.max_memory_allocated(devices.device) / 2**20
+                torch.cuda.reset_peak_memory_stats(devices.device)
+                print(f'Done in {time() - ts:.3f}s, max VRAM alloc {vram:.3f} MB')
+            else:
+                print(f'Done in {time() - ts:.3f}s')
+    
     return wrapper
 
 @perfcount
 @torch.inference_mode()
 def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
-    global sync_gn, auto_shrink, skip_infer
+    global sync_gn, zigzag_dir, zigzag_to_cpu
 
     B, C, H, W = z.shape
     is_decoder = isinstance(self, Decoder)
     scaler = opt_f if is_decoder else 1/opt_f
     ch = 3 if is_decoder else 8
     steps = 31 if is_decoder else 23
+    #result = z[:, :ch, :, :] if is_decoder else z[:, :ch, :H//opt_f, :W//opt_f]    # very cheap tmp result
+    result = None
 
     if auto_shrink:
         def auto_tile_size(low:int, high:int) -> int:
@@ -394,21 +415,24 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
     n_tiles_H = math.ceil(H / tile_size)
     n_tiles_W = math.ceil(W / tile_size)
     n_tiles = n_tiles_H * n_tiles_W
-    sync_gn = n_tiles > 1
+    sync_gn = False if force_unsync else n_tiles > 1
     fill_ratio = H * W / (n_tiles * tile_size**2)
+    print(f'>> dtype: {z.dtype}')
     print(f'>> input_size: {z.shape}')
     print(f'>> tile_size: {tile_size}')
-    print(f'>> split to {n_tiles_H}x{n_tiles_W} = {n_tiles} tiles (corner crop ratio: {1 - fill_ratio:.3%})')
+    print(f'>> split to {n_tiles_H}x{n_tiles_W} = {n_tiles} tiles (fill ratio: {fill_ratio:.3%})')
 
     if not sync_gn:
         steps = 1
-    for block, skip in skip_infer[type(self)].items():
-        if not skip: continue
-        if   'attn'  in block: steps -= 1
-        elif 'block' in block: steps -= 2
+    elif skip_infer:
+        for block, skip in skip_infer_plan[type(self)].items():
+            if not skip: continue
+            if   'attn'  in block: steps -= 1
+            elif 'block' in block: steps -= 2
 
     if pad_size != 0: z = F.pad(z, (pad_size, pad_size, pad_size, pad_size), mode='reflect')     # [B, C, H+2*pad, W+2*pad]
 
+    ''' split tiles '''
     bbox_inputs  = []
     bbox_outputs = []
     x = 0
@@ -425,24 +449,19 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
             ))
             y += tile_size
         x += tile_size
-    if DEBUG_SHAPE:
+    if DEBUG_STAGE:
         print('bbox_inputs:')
         print(bbox_inputs)
         print('bbox_outputs:')
         print(bbox_outputs)
 
+    ''' start workers '''
     workers: List[TaskGen] = []
     for bbox in bbox_inputs:
         (Hs, He), (Ws, We) = bbox
         tile = z[:, :, Hs:He, Ws:We]
         workers.append(Decoder_forward(self, tile) if is_decoder else Encoder_forward(self, tile))
-
-    if is_decoder:
-        result = z[:, :ch, :, :]     # very cheap tmp result
-    else:
-        result = z[:, :ch, :H//opt_f, :W//opt_f]
-
-    del z
+    n_workers = len(workers)
 
     interrupted = False
     pbar = tqdm(total=steps, desc=f'VAE tile {"decoding" if is_decoder else "encoding"}')
@@ -450,8 +469,18 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
         if state.interrupted or interrupted: break
         pbar.update()
 
+        # run one round
         try:
-            outputs = [ next(worker) for worker in workers ]
+            if zigzag_process:
+                outputs: List[TaskRet] = [None] * n_workers
+                for i in (reversed if zigzag_dir else iter)(range(n_workers)):
+                    zigzag_to_cpu = (i != 0) if zigzag_dir else (i != n_workers - 1)
+                    outputs[i] = next(workers[i])
+                zigzag_dir = not zigzag_dir
+            else:
+                zigzag_to_cpu = True
+                outputs = [next(worker) for worker in workers]
+
             if not 'check outputs type consistency':
                 ret_type = type(outputs[0])
             else:
@@ -462,6 +491,7 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
             print_exc()
             raise ValueError('Error: workers stopped early !!')
 
+        # handle intermediates
         if ret_type == tuple:      # GroupNorm sync barrier
             if not 'check gn object identity':
                 gn: GroupNorm = outputs[0][0]
@@ -472,25 +502,25 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
                     raise ValueError('Error: workers progressing states not synchronized !!')
                 gn: GroupNorm = list(gns)[0]
 
-            if DEBUG_SHAPE:
-                print('n_tiles:', len(outputs))
-                print('tile.shape:', outputs[0][1].shape)
-                print('tile.dtype:', outputs[0][1].dtype)   # 'cpu'
+            if DEBUG_STAGE:
+                print('n_tiles:',         len(outputs))
+                print('tile.shape:',      outputs[0][1].shape)
+                print('tile[0].device:',  outputs[0][1].device)    # 'cpu'
+                print('tile[-1].device:', outputs[-1][1].device)   # 'cuda'
 
-            var  = torch.stack([var  for _, _, (var, _)  in outputs], dim=-1).mean(dim=-1)     # [NG=32], float32
+            var  = torch.stack([var  for _, _, (var, _)  in outputs], dim=-1).mean(dim=-1)     # [NG=32], float32, 'cuda'
             mean = torch.stack([mean for _, _, (_, mean) in outputs], dim=-1).mean(dim=-1)
             for _, tile, _ in outputs:
                 if state.interrupted: interrupted = True ; break
 
-                #tile_n = gn(tile.to(devices.device))
-                tile_n = custom_group_norm(tile.to(devices.device), gn.num_groups, mean, var, gn.weight, gn.bias, gn.eps)
-                tile.data = tile_n.to(tile.dtype).cpu()
+                tile_n = custom_group_norm(tile.to(mean.device), gn.num_groups, mean, var, gn.weight, gn.bias, gn.eps)
+                tile.data = tile_n.to(tile.device)
 
         elif ret_type == Tensor:   # final Tensor splits
-            if DEBUG_SHAPE:
-              print('n_outputs:', len(outputs))
-              print('output.shape:', outputs[0].shape)
-              print('output.dtype:', outputs[0].dtype)      # 'cpu'
+            if DEBUG_STAGE:
+              print('n_outputs:',     len(outputs))
+              print('output.shape:',  outputs[0].shape)
+              print('output.device:', outputs[0].device)      # 'cpu'
             assert len(bbox_outputs) == len(outputs), 'n_tiles != n_bbox_outputs'
 
             result = torch.zeros([B, ch, int(H*scaler), int(W*scaler)], dtype=outputs[0].dtype)
@@ -507,16 +537,14 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
 
             count = count.clamp_(min=1)
             result /= count
-            break       # we're done!
+            pbar.close()
+            break               # we're done!
 
         else:
             raise ValueError(f'Error: unkown ret_type: {ret_type} !!')
 
-    # Done!
-    pbar.close()
-
+    ''' finish '''
     if not is_decoder: result = result.to(devices.device)
-
     return result
 
 
@@ -546,11 +574,15 @@ class Script(Script):
                         outputs=[encoder_tile_size, encoder_pad_size, decoder_tile_size, decoder_pad_size])
 
             with gr.Row():
-                ext_auto_shrink = gr.Checkbox(label='Auto adjust real tile size', value=lambda: DEFAULT_AUTO_SHRINK)
-                ext_skip_infer  = gr.Checkbox(label='Skip infer (experimental)',  value=lambda: DEFAULT_SKIP_INFER)
+                ext_auto_shrink    = gr.Checkbox(label='Auto adjust real tile size', value=lambda: DEFAULT_AUTO_SHRINK)
+                ext_zigzag_process = gr.Checkbox(label='Zigzag processing',          value=lambda: DEFAULT_ZIGZAG_PROCESS)
+                ext_force_unsync   = gr.Checkbox(label='Force not sync GroupNorm',   value=lambda: DEFAULT_FORCE_UNSYNC)
+                ext_skip_infer     = gr.Checkbox(label='Skip infer (experimental)',  value=lambda: DEFAULT_SKIP_INFER)
 
             with gr.Group(visible=DEFAULT_SKIP_INFER) as tab_skip_infer:
-                with gr.Accordion(label='Skip encoder blocks'):
+                gr.HTML('<p> => see "img/VAE_arch.md" for model arch reference </p>')
+
+                with gr.Tab(label='Encoder skip infer'):
                     with gr.Row(variant='compact'):
                         skip_enc_down0_block0 = gr.Checkbox(label='down0.block0')
                         skip_enc_down0_block1 = gr.Checkbox(label='down0.block1')
@@ -561,12 +593,12 @@ class Script(Script):
                         skip_enc_down2_block1 = gr.Checkbox(label='down2.block1')
                         skip_enc_down3_block0 = gr.Checkbox(label='down3.block0')
                         skip_enc_down3_block1 = gr.Checkbox(label='down3.block1')
-                    with gr.Row(variant='compact'): 
+                    with gr.Row(variant='compact'):
                         skip_enc_mid_block_1  = gr.Checkbox(label='mid.block_1')
                         skip_enc_mid_attn_1   = gr.Checkbox(label='mid.attn_1')
                         skip_enc_mid_block_2  = gr.Checkbox(label='mid.block_2')
 
-                with gr.Accordion(label='Skip decoder blocks'):
+                with gr.Tab(label='Decoder skip infer'):
                     with gr.Row(variant='compact'):
                         skip_dec_mid_block_1 = gr.Checkbox(label='mid.block_1')
                         skip_dec_mid_attn_1  = gr.Checkbox(label='mid.attn_1')
@@ -575,13 +607,14 @@ class Script(Script):
                         skip_dec_up3_block0  = gr.Checkbox(label='up3.block0')
                         skip_dec_up3_block1  = gr.Checkbox(label='up3.block1')
                         skip_dec_up3_block2  = gr.Checkbox(label='up3.block2')
-                    with gr.Row(variant='compact'):
                         skip_dec_up2_block0  = gr.Checkbox(label='up2.block0')
                         skip_dec_up2_block1  = gr.Checkbox(label='up2.block1')
                         skip_dec_up2_block2  = gr.Checkbox(label='up2.block2')
                     with gr.Row(variant='compact'):
+                        skip_dec_up1_block0  = gr.Checkbox(label='up1.block0 (no skip)', value=False, interactive=False)
                         skip_dec_up1_block1  = gr.Checkbox(label='up1.block1')
                         skip_dec_up1_block2  = gr.Checkbox(label='up1.block2')
+                        skip_dec_up0_block0  = gr.Checkbox(label='up0.block0 (no skip)', value=False, interactive=False)
                         skip_dec_up0_block1  = gr.Checkbox(label='up0.block1')
                         skip_dec_up0_block2  = gr.Checkbox(label='up0.block2')
 
@@ -591,7 +624,7 @@ class Script(Script):
             enabled, 
             encoder_tile_size, encoder_pad_size, 
             decoder_tile_size, decoder_pad_size,
-            ext_auto_shrink, ext_skip_infer,
+            ext_auto_shrink, ext_zigzag_process, ext_force_unsync, ext_skip_infer,
             skip_enc_down0_block0,
             skip_enc_down0_block1,
             skip_enc_down1_block0,
@@ -622,7 +655,7 @@ class Script(Script):
             enabled:bool, 
             encoder_tile_size:int, encoder_pad_size:int, 
             decoder_tile_size:int, decoder_pad_size:int,
-            ext_auto_shrink:bool, ext_skip_infer:bool,
+            ext_auto_shrink:bool, ext_zigzag_process:bool, ext_force_unsync:bool, ext_skip_infer:bool,
             skip_enc_down0_block0:bool,
             skip_enc_down0_block1:bool,
             skip_enc_down1_block0:bool,
@@ -665,12 +698,15 @@ class Script(Script):
             decoder.forward = decoder.original_forward
             return
 
-        global auto_shrink, skip_infer
+        global auto_shrink, zigzag_process, force_unsync, skip_infer, skip_infer_plan
 
         # store setting to globals
         auto_shrink = ext_auto_shrink
+        zigzag_process = ext_zigzag_process
+        force_unsync = ext_force_unsync
+        skip_infer = ext_skip_infer
         if ext_skip_infer:
-            skip_infer[Encoder].update({
+            skip_infer_plan[Encoder].update({
                 'down0.block0': skip_enc_down0_block0,
                 'down0.block1': skip_enc_down0_block1,
                 'down1.block0': skip_enc_down1_block0,
@@ -683,7 +719,7 @@ class Script(Script):
                 'mid.attn_1':   skip_enc_mid_attn_1,
                 'mid.block_2':  skip_enc_mid_block_2,
             })
-            skip_infer[Decoder].update({
+            skip_infer_plan[Decoder].update({
                 'mid.block_1': skip_dec_mid_block_1,
                 'mid.attn_1':  skip_dec_mid_attn_1,
                 'mid.block_2': skip_dec_mid_block_2,
@@ -698,11 +734,6 @@ class Script(Script):
                 'up0.block1':  skip_dec_up0_block1,
                 'up0.block2':  skip_dec_up0_block2,
             })
-        else:
-            for net in [Encoder, Decoder]:
-                plan = skip_infer[net]
-                for block in plan.keys():
-                    plan[block] = False
 
         # apply hijack
         encoder.forward = lambda x: VAE_forward_tile(encoder, x, encoder_tile_size, encoder_pad_size)
