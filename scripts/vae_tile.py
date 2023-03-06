@@ -171,10 +171,7 @@ def nonlinearity(x:Tensor) -> Tensor:
     return F.silu(x, inplace=True)
 
 def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
-    if zigzag_process and not zigzag_to_cpu:
-        h = x.clone()
-    else:
-        h = x
+    h = x if zigzag_to_cpu else x.clone()
 
     if sync_gn:
         var, mean = get_var_mean(h, self.norm1.num_groups, self.norm1.eps)
@@ -207,10 +204,7 @@ def Resblock_forward(self:ResnetBlock, x:Tensor) -> TaskGen:
     yield x + h
 
 def AttnBlock_forward(self:AttnBlock, x:Tensor) -> TaskGen:
-    if zigzag_process and not zigzag_to_cpu:
-        h = x.clone()
-    else:
-        h = x
+    h = x if zigzag_to_cpu else x.clone()
 
     if sync_gn:
         var, mean = get_var_mean(h, self.norm.num_groups, self.norm.eps)
@@ -430,9 +424,7 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
             if   'attn'  in block: steps -= 1
             elif 'block' in block: steps -= 2
 
-    if pad_size != 0: z = F.pad(z, (pad_size, pad_size, pad_size, pad_size), mode='reflect')     # [B, C, H+2*pad, W+2*pad]
-
-    ''' split tiles '''
+    ''' make bbox '''
     bbox_inputs  = []
     bbox_outputs = []
     x = 0
@@ -455,14 +447,21 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
         print('bbox_outputs:')
         print(bbox_outputs)
 
-    ''' start workers '''
+    ''' split tiles '''
+    if pad_size != 0: z = F.pad(z, (pad_size, pad_size, pad_size, pad_size), mode='reflect')     # [B, C, H+2*pad, W+2*pad]
+
     workers: List[TaskGen] = []
     for bbox in bbox_inputs:
         (Hs, He), (Ws, We) = bbox
         tile = z[:, :, Hs:He, Ws:We]
         workers.append(Decoder_forward(self, tile) if is_decoder else Encoder_forward(self, tile))
     n_workers = len(workers)
+    if zigzag_process and n_workers >= 3:   # trick: put two largest tiles at end
+        workers = workers[1:] + [workers[0]]
 
+    del z
+
+    ''' start workers '''
     interrupted = False
     pbar = tqdm(total=steps, desc=f'VAE tile {"decoding" if is_decoder else "encoding"}')
     while True:
@@ -522,6 +521,9 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int):
               print('output.shape:',  outputs[0].shape)
               print('output.device:', outputs[0].device)      # 'cpu'
             assert len(bbox_outputs) == len(outputs), 'n_tiles != n_bbox_outputs'
+
+            if zigzag_process and n_workers >= 3:
+                outputs = [outputs[-1]] + outputs[:-1]
 
             result = torch.zeros([B, ch, int(H*scaler), int(W*scaler)], dtype=outputs[0].dtype)
             count  = torch.zeros([B, 1,  int(H*scaler), int(W*scaler)], dtype=torch.uint8)
