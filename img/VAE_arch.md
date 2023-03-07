@@ -1,5 +1,26 @@
 ### Encoder
 
+⚪ forward
+
+```python
+x = self.conv_in(x)
+x = self.down[0].block[0](x)
+x = self.down[0].block[1](x)
+x = self.down[1].block[0](x)
+x = self.down[1].block[1](x)
+x = self.down[2].block[0](x)
+x = self.down[2].block[1](x)
+x = self.down[3].block[0](x)
+x = self.down[3].block[1](x)
+x = self.mid.block_1(x)
+x = self.mid.attn_1(x)
+x = self.mid.block_2(x)
+x = self.norm_out(x)
+x = self.conv_out(x)
+```
+
+⚪ model
+
 ```
 Encoder(
   (conv_in): Conv2d(3, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
@@ -121,6 +142,29 @@ Encoder(
 ```
 
 ### Decoder
+
+⚪ forward
+
+```python
+x = self.conv_in(x)
+x = self.mid.block_1(x)
+x = self.mid.attn_1(x)
+x = self.mid.block_2(x)
+x = self.up[3].block[0](x)      # NOTE: this is reversed
+x = self.up[3].block[1](x)
+x = self.up[3].block[2](x)
+x = self.up[2].block[0](x)
+x = self.up[2].block[1](x)
+x = self.up[2].block[2](x)
+x = self.up[1].block[1](x)
+x = self.up[1].block[2](x)
+x = self.up[0].block[1](x)
+x = self.up[0].block[2](x)
+x = self.norm_out(x)
+x = self.conv_out(x)
+```
+
+⚪ model
 
 ```
 Decoder(
