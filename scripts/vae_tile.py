@@ -802,6 +802,12 @@ class Script(Script):
         if not hasattr(encoder, 'original_forward'): encoder.original_forward = encoder.forward
         if not hasattr(decoder, 'original_forward'): decoder.original_forward = decoder.forward
 
+        # undo hijack
+        if not enabled:
+            encoder.forward = encoder.original_forward
+            decoder.forward = decoder.original_forward
+            return
+
         # extras parameters
         if enabled:
             global smart_ignore, auto_shrink, zigzag_process, gn_sync, skip_infer, skip_infer_plan
