@@ -612,16 +612,13 @@ def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) ->
         sync_approx = False
         sync_approx_plan.clear()
 
-        B, C, H, W = z.shape
-        scale_factor = tile_size / max(H, W)
-        z_hat: Tensor = F.interpolate(z, scale_factor=scale_factor, mode='nearest')    # NOTE: do NOT interp in order to keep stats
-        #z_hat: Tensor = F.interpolate(z, size=(tile_size, tile_size), mode='nearest')    # NOTE: do NOT interp in order to keep stats
+        z_hat: Tensor = F.interpolate(z, size=(tile_size, tile_size), mode='nearest')    # NOTE: do NOT interp in order to keep stats
         if DEBUG_APPROX:
             _dbg_tensor(z, 'z')
             _dbg_tensor(z_hat, 'z_hat')
-            _dbg_to_image(cheap_approximation(z_hat[0]), 'z_hat')
+            _dbg_to_image(cheap_approximation(z_hat[0].float()), 'z_hat')
 
-        if not 'stats shift':
+        if 'stats shift':
             std_src, mean_src = torch.std_mean(z_hat, dim=[0, 2, 3], keepdim=True)
             std_tgt, mean_tgt = torch.std_mean(z,     dim=[0, 2, 3], keepdim=True)
             z_hat = (z_hat - mean_src) / std_src
@@ -629,11 +626,12 @@ def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) ->
             z_hat = z_hat.clamp_(z.min(), z.max())
             if DEBUG_APPROX:
                 _dbg_tensor(z_hat, 'z_hat_shift')
-                _dbg_to_image(cheap_approximation(z_hat[0]), 'z_hat_shift')
+                _dbg_to_image(cheap_approximation(z_hat[0].float()), 'z_hat_shift')
             del std_src, mean_src, std_tgt, mean_tgt
 
         x_hat = VAE_forward_tile(self, z_hat, tile_size, pad_size)
-        if DEBUG_APPROX: _dbg_to_image(x_hat[0], 'z_approx')
+        if DEBUG_APPROX:
+            _dbg_to_image(x_hat[0].float(), 'z_approx')
         del z_hat, x_hat
 
         # apply
@@ -643,7 +641,7 @@ def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) ->
         return VAE_forward_tile(self, z, tile_size, pad_size)
     except:
         print_exc()
-        return torch.stack([cheap_approximation(sample) for sample in z], dim=0)
+        return torch.stack([cheap_approximation(sample.float()).to(sample) for sample in z], dim=0)
     finally:
         sync_approx_plan.clear()
 
