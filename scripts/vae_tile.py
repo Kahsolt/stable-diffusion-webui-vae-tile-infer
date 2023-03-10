@@ -788,8 +788,11 @@ class Script(Script):
 
         # undo hijack
         if not enabled:
-            encoder.forward = encoder.original_forward
-            decoder.forward = decoder.original_forward
+            from inspect import isfunction, getfullargspec
+            if isfunction(encoder.forward) and getfullargspec(encoder.forward).args[0] == 'x':
+                encoder.forward = encoder.original_forward
+            if isfunction(decoder.forward) and getfullargspec(decoder.forward).args[0] == 'x':
+                decoder.forward = decoder.original_forward
             return
 
         # extras parameters
