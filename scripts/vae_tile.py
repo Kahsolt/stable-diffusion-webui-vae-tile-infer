@@ -137,7 +137,6 @@ if 'global const':
 if 'global var':
     smart_ignore:   bool = None
     auto_shrink:    bool = None
-    zigzag_process: bool = None
     gn_sync:        GroupNormSync = None
     skip_infer:     bool = None
 
@@ -501,8 +500,7 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
         workers.append(Decoder_forward(self, tile) if is_decoder else Encoder_forward(self, tile))
     del z
     n_workers = len(workers)
-    if zigzag_process and n_workers >= 3:   # trick: put two largest tiles at end
-        workers = workers[1:] + [workers[0]]
+    if n_workers >= 3: workers = workers[1:] + [workers[0]]     # trick: put two largest tiles at end for full_sync zigzagging
 
     ''' start workers '''
     steps = get_n_sync(self, is_decoder) * n_workers
@@ -513,21 +511,14 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
         # run one round
         try:
             outputs: List[TaskRet] = [None] * n_workers
-            if zigzag_process:
-                for i in (reversed if zigzag_dir else iter)(range(n_workers)):
-                    if state.interrupted: return
+            for i in (reversed if zigzag_dir else iter)(range(n_workers)):
+                if state.interrupted: return
 
-                    zigzag_to_cpu = (i != 0) if zigzag_dir else (i != n_workers - 1)
-                    outputs[i] = next(workers[i])
-                    pbar.update()
-                zigzag_dir = not zigzag_dir
-            else:
-                zigzag_to_cpu = gn_sync == GroupNormSync.SYNC
-                for i in range(n_workers):
-                    if state.interrupted: return
-
-                    outputs[i] = next(workers[i])
-                    pbar.update()
+                zigzag_to_cpu = (i != 0) if zigzag_dir else (i != n_workers - 1)
+                outputs[i] = next(workers[i])
+                pbar.update()
+                if isinstance(outputs[i], Tile): workers[i] = None    # trick: release resource when done
+            zigzag_dir = not zigzag_dir
 
             if not 'check outputs type consistency':
                 ret_type = type(outputs[0])
@@ -540,7 +531,7 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
             raise ValueError('Error: workers stopped early !!')
 
         # handle intermediates
-        if   ret_type == tuple:     # GroupNorm sync barrier
+        if   ret_type == tuple:     # GroupNorm full sync barrier
             assert gn_sync == GroupNormSync.SYNC
 
             if not 'check gn object identity':
@@ -566,15 +557,14 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
                 tile_n = custom_group_norm(tile.to(mean.device), gn.num_groups, mean, var, gn.weight, gn.bias, gn.eps)
                 tile.data = tile_n.to(tile.device)
 
-        elif ret_type == Tensor:    # final Tensor splits
+        elif ret_type == Tile:      # final Tensor splits
             if DEBUG_STAGE:
               print('n_outputs:',     len(outputs))
               print('output.shape:',  outputs[0].shape)
               print('output.device:', outputs[0].device)      # 'cpu'
             assert len(bbox_outputs) == len(outputs), 'n_tiles != n_bbox_outputs'
 
-            if zigzag_process and n_workers >= 3:
-                outputs = [outputs[-1]] + outputs[:-1]
+            if n_workers >= 3: outputs = [outputs[-1]] + outputs[:-1]   # trick: rev put two largest tiles at end for full_sync zigzagging
 
             result = torch.zeros([B, ch, int(H*scaler), int(W*scaler)], dtype=outputs[0].dtype)
             crop_pad = lambda x, P: x if P == 0 else x[:, :, P:-P, P:-P]
@@ -596,18 +586,17 @@ def VAE_forward_tile(self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
 def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) -> Tensor:
     if not enabled: return self.original_forward(z)
 
-    B, C, H, W = z.shape
-    is_one_tile = max(H, W) <= tile_size
-    if is_one_tile and smart_ignore: return self.original_forward(z)
+    global gn_sync, sync_approx, sync_approx_plan
 
-    global gn_sync
-    if gn_sync == GroupNormSync.APPROX and is_one_tile:
-        print('<< ignore gn_sync APPROX due to tensor to small ;)')
-        gn_sync = GroupNormSync.UNSYNC
+    B, C, H, W = z.shape
+    if max(H, W) <= tile_size:
+        if smart_ignore:
+            return self.original_forward(z)
+        if gn_sync == GroupNormSync.APPROX:
+            print('<< ignore gn_sync=APPROX due to tensor to small ;)')
+            gn_sync = GroupNormSync.UNSYNC
 
     if gn_sync == GroupNormSync.APPROX:
-        global sync_approx, sync_approx_plan
-
         # collect
         sync_approx = False
         sync_approx_plan.clear()
@@ -658,7 +647,6 @@ class Script(Script):
         with gr.Accordion('Yet Another VAE Tiling', open=DEFAULT_OPEN):
             with gr.Row(variant='compact').style(equal_height=True):
                 enabled = gr.Checkbox(label='Enabled', value=lambda: DEFAULT_ENABLED)
-                ext_smart_ignore = gr.Checkbox(label='Do not process small images', value=lambda: DEFAULT_SMART_IGNORE)
                 reset = gr.Button(value='↻', variant='tool')
 
             with gr.Row(variant='compact').style(equal_height=True):
@@ -673,10 +661,10 @@ class Script(Script):
                         outputs=[encoder_tile_size, encoder_pad_size, decoder_tile_size, decoder_pad_size])
 
             with gr.Row(variant='compact').style(equal_height=True):
-                ext_auto_shrink    = gr.Checkbox(label='Auto adjust real tile size', value=lambda: DEFAULT_AUTO_SHRINK)
-                ext_zigzag_process = gr.Checkbox(label='Zigzag processing',          value=lambda: DEFAULT_ZIGZAG_PROCESS)
-                ext_gn_sync        = gr.Dropdown(label='GroupNorm sync',             value=lambda: DEFAULT_GN_SYNC, choices=[e.value for e in GroupNormSync])
-                ext_skip_infer     = gr.Checkbox(label='Skip infer (experimental)',  value=lambda: DEFAULT_SKIP_INFER)
+                ext_smart_ignore = gr.Checkbox(label='Do not process small images', value=lambda: DEFAULT_SMART_IGNORE)
+                ext_auto_shrink  = gr.Checkbox(label='Auto adjust real tile size',  value=lambda: DEFAULT_AUTO_SHRINK)
+                ext_gn_sync      = gr.Dropdown(label='GroupNorm sync',              value=lambda: DEFAULT_GN_SYNC, choices=[e.value for e in GroupNormSync])
+                ext_skip_infer   = gr.Checkbox(label='Skip infer (experimental)',   value=lambda: DEFAULT_SKIP_INFER)
 
             with gr.Group(visible=DEFAULT_SKIP_INFER) as tab_skip_infer:
                 with gr.Tab(label='Encoder skip infer'):
@@ -726,7 +714,6 @@ class Script(Script):
             decoder_tile_size, decoder_pad_size,
             ext_smart_ignore,
             ext_auto_shrink,
-            ext_zigzag_process, 
             ext_gn_sync, 
             ext_skip_infer,
             skip_enc_down0_block0,
@@ -761,7 +748,6 @@ class Script(Script):
             decoder_tile_size:int, decoder_pad_size:int,
             ext_smart_ignore:bool, 
             ext_auto_shrink:bool, 
-            ext_zigzag_process:bool, 
             ext_gn_sync:str, 
             ext_skip_infer:bool,
             skip_enc_down0_block0:bool,
@@ -808,12 +794,11 @@ class Script(Script):
 
         # extras parameters
         if enabled:
-            global smart_ignore, auto_shrink, zigzag_process, gn_sync, skip_infer, skip_infer_plan
+            global smart_ignore, auto_shrink, gn_sync, skip_infer, skip_infer_plan
 
             # store setting to globals
             smart_ignore   = ext_smart_ignore
             auto_shrink    = ext_auto_shrink
-            zigzag_process = ext_zigzag_process
             gn_sync        = GroupNormSync(ext_gn_sync)
             skip_infer     = ext_skip_infer
 
