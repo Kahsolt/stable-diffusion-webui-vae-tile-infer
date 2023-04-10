@@ -4,11 +4,10 @@
 
 ----
 
-**VAE encoding / decoding is resource exhausting, often gets OOM (Out Of Memeory) errors or black images (NaNs).**
-**You need this extension to draw large 2k/4k/8k images on low VRAM devices :)**
+⚠ This repo is more experimental than the production-ready [multidiffusion-upscaler-for-automatic1111](https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111)'s implementation, please use that in production.  
+⚠ But for developers want to see our idea, code in this repo is more clear & neat to understand.  
 
-ℹ To draw really huge picture, you could use => [multidiffusion-upscaler-for-automatic1111](https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111)
-⚠ When processing with large images, please **turn off previews** to really save time and resoureces!!
+ℹ When processing with large images, please **turn off previews** to really save time and resoureces!!
 
 ⚠ 我们成立了插件反馈 QQ 群: 616795645 (赤狐屿)，欢迎出建议、意见、报告bug等 (w  
 ⚠ We have a QQ chat group (616795645) now, any suggestions, discussions and bug reports are highly wellllcome!!  
