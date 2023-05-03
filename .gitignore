@@ -1,3 +1,8 @@
 # meta
 .vscode/
 __pycache__/
+
+# experiments
+exp/*/*
+!exp/*/*.py
+!exp/*/*.cmd

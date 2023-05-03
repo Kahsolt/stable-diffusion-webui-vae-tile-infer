@@ -118,7 +118,7 @@ class GroupNormSync(Enum):
 
 if 'global const':
     DEFAULT_OPEN              = False
-    DEFAULT_ENABLED           = True
+    DEFAULT_ENABLED           = False
     DEFAULT_SMART_IGNORE      = True
     DEFAULT_ENCODER_PAD_SIZE  = 16
     DEFAULT_DECODER_PAD_SIZE  = 2
@@ -596,6 +596,10 @@ def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) ->
             print('<< ignore gn_sync=APPROX due to tensor to small ;)')
             gn_sync = GroupNormSync.UNSYNC
 
+    cached_gn_sync = gn_sync
+    if gn_sync == GroupNormSync.APPROX and isinstance(self, Encoder):   # do not allow approx on encoder
+        gn_sync = GroupNormSync.SYNC
+
     if gn_sync == GroupNormSync.APPROX:
         # collect
         sync_approx = False
@@ -633,6 +637,7 @@ def VAE_hijack(enabled:bool, self:Net, z:Tensor, tile_size:int, pad_size:int) ->
         return torch.stack([cheap_approximation(sample.float()).to(sample) for sample in z], dim=0)
     finally:
         sync_approx_plan.clear()
+        gn_sync = cached_gn_sync
 
 
 class Script(Script):

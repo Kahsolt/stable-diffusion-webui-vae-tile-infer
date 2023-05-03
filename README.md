@@ -4,8 +4,8 @@
 
 ----
 
-⚠ This repo is more experimental than the production-ready [multidiffusion-upscaler-for-automatic1111](https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111)'s implementation, please use that in production.  
-⚠ But for developers want to see our idea, code in this repo is more clear & neat to understand.  
+⚠ This repo is for **experiments & code study** use for developers who wanna read our idea. 😀
+⚠ You should use [multidiffusion-upscaler-for-automatic1111](https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111)'s implementation **in production**, we put updates there.
 
 ℹ When processing with large images, please **turn off previews** to really save time and resoureces!!
 
@@ -83,7 +83,6 @@ skip_infer  = None
 - `Encoder/Decoder tile size`: image tile as the actual processing unit; **set it as large as possible before gets OOM** :)
 - `Encoder/Decoder pad size`: overlapped padding of each tile; larger value making more seamless
 - `Auto adjust real tile size`: auto shrink real tile size to match tensor shape, avoding too small tailing tile
-- `Zigzag processing`: always keep at least one tile on GPU, will be faster but requires a bit more VRAM (only effects when `gn_sync=FULL_SYNC`)
 - `GroupNorm sync`: how to sync GroupNorm stats
   - `Approximated`: using stats from the pre-computed low-resolution image
   - `Full sync`: using accurate stats to sync globally
